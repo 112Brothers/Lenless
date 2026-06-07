@@ -1,0 +1,4 @@
+test:
+  _target_: src.datasets.CustomDirDataset
+  data_dir: null  # Override via CLI: data_dir=/path/to/dataset
+  instance_transforms: ${transforms.instance_transforms.inference}

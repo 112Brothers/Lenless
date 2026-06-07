@@ -1,0 +1,14 @@
+defaults:
+  - model: modular_pre_post
+  - metrics: reconstruction
+  - datasets: digicam_eval
+  - dataloader: lensless
+  - transforms: lensless
+  - _self_
+inferencer:
+  device_tensors: ["lensless", "mask", "lensed"]
+  device: auto
+  save_path: "inference_output"
+  seed: 42
+  from_pretrained: "saved/model_best.pth"
+  skip_model_load: False

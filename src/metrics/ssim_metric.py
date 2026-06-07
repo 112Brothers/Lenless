@@ -1,0 +1,29 @@
+"""
+SSIM metric using torchmetrics.
+"""
+
+import torch
+from src.metrics.base_metric import BaseMetric
+
+
+class SSIMMetric(BaseMetric):
+    """SSIM metric for image reconstruction."""
+
+    def __init__(self, device, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from torchmetrics.image import StructuralSimilarityIndexMeasure
+
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        self.metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+
+    def __call__(self, reconstruction, lensed, **kwargs):
+        """
+        Args:
+            reconstruction: (B, C, H, W) predicted image in [0, 1]
+            lensed: (B, C, H, W) ground truth image in [0, 1]
+        Returns:
+            SSIM value (float)
+        """
+        return self.metric(reconstruction, lensed).item()

@@ -1,0 +1,8 @@
+train:
+  _target_: src.datasets.DigiCamDataset
+  split: train
+  instance_transforms: ${transforms.instance_transforms.train}
+test:
+  _target_: src.datasets.DigiCamDataset
+  split: test
+  instance_transforms: ${transforms.instance_transforms.inference}

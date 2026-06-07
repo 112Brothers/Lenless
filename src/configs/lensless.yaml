@@ -1,0 +1,35 @@
+defaults:
+  - model: le_admm20
+  - writer: cometml
+  - metrics: reconstruction
+  - datasets: digicam
+  - dataloader: lensless
+  - transforms: lensless
+  - _self_
+
+optimizer:
+  _target_: torch.optim.Adam
+  lr: 1.0e-4
+
+lr_scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  T_max: ${trainer.n_epochs}
+
+loss_function:
+  _target_: src.loss.ReconstructionLoss
+  lpips_weight: 0.1
+
+trainer:
+  log_step: 50
+  n_epochs: 50
+  epoch_len: null  # epoch-based
+  device_tensors: ["lensless", "mask", "lensed"]
+  resume_from: null
+  device: auto
+  override: True
+  monitor: "max test_PSNR"
+  save_period: 5
+  early_stop: ${trainer.n_epochs}
+  save_dir: "saved"
+  seed: 42
+  max_grad_norm: 1.0

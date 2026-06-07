@@ -1,0 +1,17 @@
+torch>=2.0.0
+torchvision>=0.15.0
+torchmetrics
+numpy
+tqdm
+matplotlib
+pandas
+comet_ml
+hydra-core
+omegaconf
+datasets
+lpips
+Pillow
+scipy
+black
+isort
+pre-commit
