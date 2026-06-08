@@ -47,31 +47,35 @@ class Trainer(BaseTrainer):
         Log data from batch. Calls self.writer.add_* to log data
         to the experiment tracker.
         """
-        if mode == "train":
-            # Log sample images: lensless | ground truth | reconstruction
-            # Only log if tensors have 3 channels (C, H, W)
-            if batch["lensless"][0].shape[0] == 3:
-                self.writer.add_image(
-                    "lensless", batch["lensless"][0].cpu()
-                )
-            if "lensed" in batch and batch["lensed"][0].shape[0] == 3:
-                self.writer.add_image(
-                    "ground_truth", batch["lensed"][0].cpu()
-                )
-            if batch["reconstruction"][0].shape[0] == 3:
-                self.writer.add_image(
-                    "reconstruction", batch["reconstruction"][0].detach().cpu()
-                )
-        else:
-            # Log a few samples during evaluation
-            for i in range(min(3, batch["reconstruction"].shape[0])):
-                if batch["reconstruction"][i].shape[0] == 3:
+        try:
+            if mode == "train":
+                # Log sample images: lensless | ground truth | reconstruction
+                # Only log if tensors have 3 channels (C, H, W)
+                if batch["lensless"][0].shape[0] == 3:
                     self.writer.add_image(
-                        f"sample_{i}_reconstruction",
-                        batch["reconstruction"][i].detach().cpu()
+                        "lensless", batch["lensless"][0].cpu()
                     )
-                if "lensed" in batch and batch["lensed"][i].shape[0] == 3:
+                if "lensed" in batch and batch["lensed"][0].shape[0] == 3:
                     self.writer.add_image(
-                        f"sample_{i}_ground_truth",
-                        batch["lensed"][i].cpu()
+                        "ground_truth", batch["lensed"][0].cpu()
                     )
+                if batch["reconstruction"][0].shape[0] == 3:
+                    self.writer.add_image(
+                        "reconstruction", batch["reconstruction"][0].detach().cpu()
+                    )
+            else:
+                # Log a few samples during evaluation
+                for i in range(min(3, batch["reconstruction"].shape[0])):
+                    if batch["reconstruction"][i].shape[0] == 3:
+                        self.writer.add_image(
+                            f"sample_{i}_reconstruction",
+                            batch["reconstruction"][i].detach().cpu()
+                        )
+                    if "lensed" in batch and batch["lensed"][i].shape[0] == 3:
+                        self.writer.add_image(
+                            f"sample_{i}_ground_truth",
+                            batch["lensed"][i].cpu()
+                        )
+        except Exception as e:
+            # Silently skip logging errors (e.g., CometML image conversion issues)
+            pass
