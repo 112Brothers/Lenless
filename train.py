@@ -45,9 +45,13 @@ def main(config):
     metrics = instantiate(config.metrics)
 
     # Build optimizer, learning rate scheduler
-    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
-    optimizer = instantiate(config.optimizer, params=trainable_params)
-    lr_scheduler = instantiate(config.lr_scheduler, optimizer=optimizer)
+    trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
+    if trainable_params:
+        optimizer = instantiate(config.optimizer, params=trainable_params)
+        lr_scheduler = instantiate(config.lr_scheduler, optimizer=optimizer)
+    else:
+        optimizer = None
+        lr_scheduler = None
 
     # Epoch_len = number of iterations for iteration-based training
     epoch_len = config.trainer.get("epoch_len")

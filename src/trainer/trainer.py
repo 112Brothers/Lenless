@@ -18,7 +18,8 @@ class Trainer(BaseTrainer):
         metric_funcs = self.metrics["inference"]
         if self.is_train:
             metric_funcs = self.metrics["train"]
-            self.optimizer.zero_grad()
+            if self.optimizer is not None:
+                self.optimizer.zero_grad()
 
         outputs = self.model(**batch)
         batch.update(outputs)
@@ -26,7 +27,7 @@ class Trainer(BaseTrainer):
         all_losses = self.criterion(**batch)
         batch.update(all_losses)
 
-        if self.is_train:
+        if self.is_train and self.optimizer is not None:
             batch["loss"].backward()
             self._clip_grad_norm()
             self.optimizer.step()
