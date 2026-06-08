@@ -50,7 +50,14 @@ class DigiCamDataset(Dataset):
         # Check the actual format and adapt accordingly
         lensless = self._to_tensor(sample["lensless"])  # (3, H, W)
         lensed = self._to_tensor(sample["lensed"])      # (3, H, W)
-        mask = self._load_mask(sample["mask"])           # (H, W)
+        
+        # Load mask if available, otherwise create a dummy uniform mask
+        if "mask" in sample:
+            mask = self._load_mask(sample["mask"])      # (H, W)
+        else:
+            # Create a uniform mask (all ones, normalized)
+            H, W = lensless.shape[1:]
+            mask = torch.ones(H, W, dtype=torch.float32) / (H * W)
 
         instance_data = {
             "lensless": lensless,
