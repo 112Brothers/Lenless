@@ -161,6 +161,18 @@ class BaseTrainer:
         and monitoring the performance improvement (for early stopping
         and saving the best checkpoint).
         """
+        # If no optimizer (e.g., ADMM), skip training and only evaluate
+        if self.optimizer is None:
+            self.logger.info("No optimizer found. Skipping training, evaluating only.")
+            self._last_epoch = 1
+            result = self._evaluation_only()
+            logs = {"epoch": 1}
+            logs.update(result)
+            for key, value in logs.items():
+                self.logger.info(f"    {key:15s}: {value}")
+            self._save_checkpoint(1, save_best=True, only_best=True)
+            return
+        
         not_improved_count = 0
         for epoch in range(self.start_epoch, self.epochs + 1):
             self._last_epoch = epoch
@@ -251,6 +263,19 @@ class BaseTrainer:
 
         return logs
 
+    def _evaluation_only(self):
+        """
+        Evaluate model without training (for models without learnable parameters).
+        
+        Returns:
+            logs (dict): logs that contain the information about evaluation.
+        """
+        logs = {}
+        for part, dataloader in self.evaluation_dataloaders.items():
+            val_logs = self._evaluation_epoch(1, part, dataloader)
+            logs.update(**{f"{part}_{name}": value for name, value in val_logs.items()})
+        return logs
+
     def _evaluation_epoch(self, epoch, part, dataloader):
         """
         Evaluate model on the partition after training for an epoch.
@@ -270,6 +295,7 @@ class BaseTrainer:
                 enumerate(dataloader),
                 desc=part,
                 total=len(dataloader),
+                disable=False,
             ):
                 batch = self.process_batch(
                     batch,
