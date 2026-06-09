@@ -18,12 +18,22 @@ def collate_fn(dataset_items: list[dict]):
     """
     result_batch = {}
 
+    # Maximum spatial size to prevent OOM on large lensed images.
+    # DigiCam lensed images vary from ~190px to ~500px; cap at 270px.
+    MAX_SIZE = 270
+
     # Determine target size: prefer lensed (ground truth) size if available,
     # otherwise fall back to lensless size.
     if "lensed" in dataset_items[0]:
         target_h, target_w = dataset_items[0]["lensed"].shape[1:]
     else:
         target_h, target_w = dataset_items[0]["lensless"].shape[1:]
+
+    # Cap to MAX_SIZE while preserving aspect ratio
+    if target_h > MAX_SIZE or target_w > MAX_SIZE:
+        scale = MAX_SIZE / max(target_h, target_w)
+        target_h = int(target_h * scale)
+        target_w = int(target_w * scale)
 
     # Resize all lensless images to target size
     lensless_list = []
