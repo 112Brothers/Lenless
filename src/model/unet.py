@@ -42,15 +42,21 @@ class Down(nn.Module):
 class Up(nn.Module):
     """Upscaling then double conv"""
 
-    def __init__(self, in_channels, out_channels, bilinear=True):
+    def __init__(self, in_channels, skip_channels, out_channels, bilinear=True):
+        """
+        Args:
+            in_channels: channels from the decoder path (upsampled)
+            skip_channels: channels from the encoder skip connection
+            out_channels: output channels
+        """
         super().__init__()
 
         if bilinear:
             self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-            self.conv = DoubleConv(in_channels, out_channels)
         else:
-            self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
-            self.conv = DoubleConv(in_channels, out_channels)
+            self.up = nn.ConvTranspose2d(in_channels, in_channels, kernel_size=2, stride=2)
+
+        self.conv = DoubleConv(in_channels + skip_channels, out_channels)
 
     def forward(self, x1, x2):
         x1 = self.up(x1)
@@ -86,11 +92,12 @@ class UNet(nn.Module):
         # Bottleneck
         self.bottleneck = DoubleConv(base_channels * 8, base_channels * 16)
 
-        # Decoder
-        self.up1 = Up(base_channels * 16, base_channels * 8)
-        self.up2 = Up(base_channels * 8, base_channels * 4)
-        self.up3 = Up(base_channels * 4, base_channels * 2)
-        self.up4 = Up(base_channels * 2, base_channels)
+        # Decoder: Up(in_channels, skip_channels, out_channels)
+        # After cat: in_channels + skip_channels -> out_channels
+        self.up1 = Up(base_channels * 16, base_channels * 8, base_channels * 8)
+        self.up2 = Up(base_channels * 8,  base_channels * 4, base_channels * 4)
+        self.up3 = Up(base_channels * 4,  base_channels * 2, base_channels * 2)
+        self.up4 = Up(base_channels * 2,  base_channels,     base_channels)
 
         # Final conv
         self.outc = nn.Conv2d(base_channels, out_channels, kernel_size=1)
