@@ -11,6 +11,7 @@ from src.model.fft_utils import (
     compute_fft_shape,
     crop_from_fft,
     finite_diff,
+    finite_diff_adjoint,
     pad_to_fft,
     psf_to_otf,
     soft_threshold,
@@ -78,7 +79,7 @@ class ADMM(nn.Module):
         for _ in range(self.n_iter):
             # x-update in frequency domain
             # rhs = A^T y + mu * D^T(z - u)
-            rhs_spatial = finite_diff_adjoint_from_components(
+            rhs_spatial = finite_diff_adjoint(
                 zx - ux, zy - uy
             )
             RHS = ATy + self.mu * torch.fft.rfft2(rhs_spatial)
@@ -113,12 +114,3 @@ class ADMM(nn.Module):
         return result_info
 
 
-def finite_diff_adjoint_from_components(dx, dy):
-    """Helper: compute D^T from separate dx, dy components.
-    
-    Adjoint of Dx[i,j] = x[i,j+1] - x[i,j] is:
-    D^T_x v[i,j] = v[i,j-1] - v[i,j] = roll(v, +1) - v
-    """
-    adj_dx = torch.roll(dx, shifts=1, dims=-1) - dx
-    adj_dy = torch.roll(dy, shifts=1, dims=-2) - dy
-    return adj_dx + adj_dy

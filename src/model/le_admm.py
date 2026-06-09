@@ -11,11 +11,11 @@ from src.model.fft_utils import (
     compute_fft_shape,
     crop_from_fft,
     finite_diff,
+    finite_diff_adjoint,
     pad_to_fft,
     psf_to_otf,
     soft_threshold,
 )
-from src.model.admm import finite_diff_adjoint_from_components
 
 
 class LeADMM(nn.Module):
@@ -80,7 +80,7 @@ class LeADMM(nn.Module):
             # x-update: denominator changes each iteration due to mu
             denom = otf_abs_sq + mu * (dx_abs_sq + dy_abs_sq) + 1e-8
 
-            rhs_spatial = finite_diff_adjoint_from_components(
+            rhs_spatial = finite_diff_adjoint(
                 zx - ux, zy - uy
             )
             RHS = ATy + mu * torch.fft.rfft2(rhs_spatial)
