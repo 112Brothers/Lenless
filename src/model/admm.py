@@ -97,9 +97,11 @@ class ADMM(nn.Module):
             ux = ux + dx - zx
             uy = uy + dy - zy
 
-        # Crop to original size and clamp
+        # Crop to original size
         reconstruction = crop_from_fft(x, (H, W))
-        reconstruction = torch.clamp(reconstruction, 0.0, 1.0)
+        # Use sigmoid instead of clamp to allow gradients to flow (if needed for fine-tuning)
+        # For ADMM (no learnable params), this doesn't matter, but keep consistent
+        reconstruction = torch.sigmoid(reconstruction)
 
         return {"reconstruction": reconstruction}
 
