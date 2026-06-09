@@ -21,7 +21,7 @@ loss_function:
 
 trainer:
   log_step: 50
-  n_epochs: 50
+  n_epochs: 30
   epoch_len: null  # epoch-based
   device_tensors: ["lensless", "mask", "lensed"]
   resume_from: null
