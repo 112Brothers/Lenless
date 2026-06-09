@@ -11,13 +11,19 @@ def collate_fn(dataset_items: list[dict]):
     Collate lensless dataset items into a batch.
 
     Handles optional fields (lensed may not exist, image_id is a string).
-    Resizes all images to the same size (smallest common size or largest).
+
+    Target size is determined by the ground truth (lensed) image if available,
+    otherwise by the lensless image. This ensures metrics are computed at the
+    correct resolution and avoids upscaling the ground truth.
     """
     result_batch = {}
 
-    # Find common size (use the size of the first item)
-    # If sizes differ, resize all to match the first item
-    target_h, target_w = dataset_items[0]["lensless"].shape[1:]
+    # Determine target size: prefer lensed (ground truth) size if available,
+    # otherwise fall back to lensless size.
+    if "lensed" in dataset_items[0]:
+        target_h, target_w = dataset_items[0]["lensed"].shape[1:]
+    else:
+        target_h, target_w = dataset_items[0]["lensless"].shape[1:]
 
     # Resize all lensless images to target size
     lensless_list = []
