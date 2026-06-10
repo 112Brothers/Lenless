@@ -97,11 +97,15 @@ class ADMM(nn.Module):
             ux = ux + dx - zx
             uy = uy + dy - zy
 
-        # Crop to original size
+        # Crop to original size and normalize by max value per sample
         reconstruction = crop_from_fft(x, (H, W))
-        # Use sigmoid instead of clamp to allow gradients to flow (if needed for fine-tuning)
-        # For ADMM (no learnable params), this doesn't matter, but keep consistent
-        reconstruction = torch.sigmoid(reconstruction)
+        
+        # Normalize by max value per sample (standard in Le-ADMM).
+        # This keeps x in [0, 1] range without killing gradients like clamp does.
+        recon_flat = reconstruction.flatten(1)  # (B, C*H*W)
+        recon_max = recon_flat.max(dim=1).values.clamp(min=1e-8)  # (B,)
+        recon_max = recon_max[:, None, None, None]  # (B, 1, 1, 1)
+        reconstruction = reconstruction / recon_max
 
         return {"reconstruction": reconstruction}
 

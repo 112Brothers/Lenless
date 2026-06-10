@@ -97,8 +97,8 @@ class LeADMM(nn.Module):
             ux = ux + dx - zx
             uy = uy + dy - zy
 
-        # Final x-update after all iterations to ensure all parameters affect output
-        # This ensures tau[n_iter-1] has gradient flow
+        # Final x-update after all iterations to ensure log_tau[-1] gets gradient.
+        # After the last z/u-update, do one more x-update so that tau[-1] affects the final x.
         mu = torch.exp(self.log_mu[-1])
         rhs_spatial = finite_diff_adjoint(zx - ux, zy - uy)
         RHS = ATy + mu * torch.fft.rfft2(rhs_spatial)
@@ -106,9 +106,14 @@ class LeADMM(nn.Module):
         x = torch.fft.irfft2(X, s=fft_shape)
 
         reconstruction = crop_from_fft(x, (H, W))
-        # Use sigmoid instead of clamp to allow gradients to flow
-        # clamp blocks gradients for out-of-range values
-        reconstruction = torch.sigmoid(reconstruction)
+        
+        # Normalize by max value per sample (standard in Le-ADMM).
+        # This keeps x in [0, 1] range without killing gradients like clamp does.
+        # Divide each sample by its max value.
+        recon_flat = reconstruction.flatten(1)  # (B, C*H*W)
+        recon_max = recon_flat.max(dim=1).values.clamp(min=1e-8)  # (B,)
+        recon_max = recon_max[:, None, None, None]  # (B, 1, 1, 1)
+        reconstruction = reconstruction / recon_max
 
         return {"reconstruction": reconstruction}
 
