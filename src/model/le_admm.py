@@ -114,6 +114,9 @@ class LeADMM(nn.Module):
         recon_max = recon_flat.max(dim=1).values.clamp(min=1e-8)  # (B,)
         recon_max = recon_max[:, None, None, None]  # (B, 1, 1, 1)
         reconstruction = reconstruction / recon_max
+        
+        # Clamp to [0, 1] to handle any remaining negative values from numerical errors
+        reconstruction = torch.clamp(reconstruction, 0.0, 1.0)
 
         return {"reconstruction": reconstruction}
 
