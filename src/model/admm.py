@@ -1,6 +1,14 @@
 """
 Standard ADMM for lensless image reconstruction with TV regularization.
 Fixed hyperparameters (not learnable).
+
+Reference: "Learned reconstructions for practical mask-based lensless imaging"
+           https://arxiv.org/abs/1908.11502
+
+Task spec hyperparameters: mu = 1e-4, tau = 2e-4.
+TV regularizer: anisotropic (separate x/y soft-thresholding).
+Finite differences: circular (roll-based).
+Working space: padded ~2H x 2W FFT-friendly space.
 """
 
 import torch
@@ -22,6 +30,13 @@ class ADMM(nn.Module):
     """
     Standard ADMM for lensless image reconstruction with TV regularization.
     Fixed hyperparameters (not learnable).
+
+    ADMM solves: min_x 0.5*||Hx - y||^2 + tau*TV(x)
+    via variable splitting with z = Dx, u = dual variable.
+
+    x-update: (H^T H + mu*(Dx^T Dx + Dy^T Dy)) x = H^T y + mu*D^T(z - u)
+    z-update: z = soft_threshold(Dx + u, tau/mu)
+    u-update: u = u + Dx - z
     """
 
     def __init__(self, n_iter=100, mu=1e-4, tau=2e-4):
@@ -33,29 +48,27 @@ class ADMM(nn.Module):
     def forward(self, lensless, mask, **batch):
         """
         Args:
-            lensless: (B, C, H, W) lensless measurement
-            mask: (B, H_m, W_m) PSF/mask
+            lensless: (B, C, H, W) lensless measurement in [0, 1]
+            mask: (B, H_m, W_m) PSF/mask (normalized to sum=1)
         Returns:
-            dict with "reconstruction": (B, C, H, W) reconstructed image
+            dict with "reconstruction": (B, C, H, W) in [0, 1]
         """
         B, C, H, W = lensless.shape
         device = lensless.device
 
-        # Compute FFT shape (padded space)
+        # Compute padded FFT shape (~2H x 2W, FFT-friendly)
         fft_shape = compute_fft_shape(H, W)
 
-        # Prepare mask: add channel dim if needed → (B, 1, H_m, W_m)
+        # Prepare PSF: add channel dim → (B, 1, H_m, W_m)
         if mask.ndim == 3:
             mask = mask.unsqueeze(1)
-        # Expand mask to match channels if single-channel
-        # PSF is the same for all RGB channels
 
-        # Compute OTF from PSF
-        otf = psf_to_otf(mask, fft_shape)  # (B, 1, fft_H, fft_W//2+1)
+        # Compute OTF and its conjugate/magnitude-squared
+        otf = psf_to_otf(mask, fft_shape)          # (B, 1, fft_H, fft_W//2+1)
         otf_conj = torch.conj(otf)
-        otf_abs_sq = torch.abs(otf) ** 2  # |H|^2
+        otf_abs_sq = torch.abs(otf) ** 2            # |H|^2
 
-        # Compute finite difference OTFs
+        # Finite-difference OTFs for TV regularizer
         dx_otf, dy_otf = compute_d_otf(fft_shape, device)
         dx_abs_sq = torch.abs(dx_otf) ** 2
         dy_abs_sq = torch.abs(dy_otf) ** 2
@@ -64,51 +77,50 @@ class ADMM(nn.Module):
         # denom = |H|^2 + mu * (|Dx|^2 + |Dy|^2)
         denom = otf_abs_sq + self.mu * (dx_abs_sq + dy_abs_sq) + 1e-8
 
-        # Precompute A^T y in frequency domain
+        # Precompute H^T y in frequency domain
         y_padded = pad_to_fft(lensless, fft_shape)
         Y = torch.fft.rfft2(y_padded)
-        ATy = otf_conj * Y  # (B, C, fft_H, fft_W//2+1)
+        ATy = otf_conj * Y                          # (B, C, fft_H, fft_W//2+1)
 
-        # Initialize variables (all zeros in padded space)
-        # z = (zx, zy) — gradient-domain dual variables
+        # Initialize ADMM variables (all zeros in padded space)
         zx = torch.zeros(B, C, fft_shape[0], fft_shape[1], device=device)
         zy = torch.zeros_like(zx)
         ux = torch.zeros_like(zx)
         uy = torch.zeros_like(zx)
 
+        # Soft-threshold value: tau/mu (standard ADMM proximal derivation)
+        threshold = self.tau / self.mu
+
         for _ in range(self.n_iter):
-            # x-update in frequency domain
-            # rhs = A^T y + mu * D^T(z - u)
-            rhs_spatial = finite_diff_adjoint(
-                zx - ux, zy - uy
-            )
+            # x-update: solve in frequency domain
+            # (H^T H + mu*(Dx^T Dx + Dy^T Dy)) X = H^T y + mu * D^T(z - u)
+            rhs_spatial = finite_diff_adjoint(zx - ux, zy - uy)
             RHS = ATy + self.mu * torch.fft.rfft2(rhs_spatial)
             X = RHS / denom
             x = torch.fft.irfft2(X, s=fft_shape)
 
-            # Compute Dx for z-update and u-update
+            # Compute finite differences of x
             dx, dy = finite_diff(x)
 
-            # z-update: soft thresholding
-            zx = soft_threshold(dx + ux, self.tau / self.mu)
-            zy = soft_threshold(dy + uy, self.tau / self.mu)
+            # z-update: anisotropic TV proximal step
+            # prox_{(tau/mu)*||.||_1}(v) = soft_threshold(v, tau/mu)
+            zx = soft_threshold(dx + ux, threshold)
+            zy = soft_threshold(dy + uy, threshold)
 
-            # u-update
+            # u-update (scaled dual variable)
             ux = ux + dx - zx
             uy = uy + dy - zy
 
-        # Crop to original size and normalize by max value per sample
+        # Crop back to original image size
         reconstruction = crop_from_fft(x, (H, W))
-        
-        # Normalize by max value per sample (standard in Le-ADMM).
-        # This keeps x in [0, 1] range without killing gradients like clamp does.
-        recon_flat = reconstruction.flatten(1)  # (B, C*H*W)
-        recon_max = recon_flat.max(dim=1).values.clamp(min=1e-8)  # (B,)
-        recon_max = recon_max[:, None, None, None]  # (B, 1, 1, 1)
+
+        # Normalize per sample: clamp negatives then divide by max.
+        # This matches the Le-ADMM paper's normalize_image() function.
+        reconstruction = torch.clamp(reconstruction, min=0.0)
+        recon_flat = reconstruction.flatten(1)                          # (B, C*H*W)
+        recon_max = recon_flat.max(dim=1).values.clamp(min=1e-8)       # (B,)
+        recon_max = recon_max[:, None, None, None]                      # (B, 1, 1, 1)
         reconstruction = reconstruction / recon_max
-        
-        # Clamp to [0, 1] to handle any remaining negative values from numerical errors
-        reconstruction = torch.clamp(reconstruction, 0.0, 1.0)
 
         return {"reconstruction": reconstruction}
 
@@ -121,5 +133,3 @@ class ADMM(nn.Module):
         result_info += f"\nAll parameters: {all_parameters}"
         result_info += f"\nTrainable parameters: {trainable_parameters}"
         return result_info
-
-

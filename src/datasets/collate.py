@@ -12,22 +12,22 @@ def collate_fn(dataset_items: list[dict]):
 
     Handles optional fields (lensed may not exist, image_id is a string).
 
-    Target size is determined by the ground truth (lensed) image if available,
-    otherwise by the lensless image. This ensures metrics are computed at the
-    correct resolution and avoids upscaling the ground truth.
+    Target size is determined by the lensless image (the model input).
+    The lensed (ground truth) image is resized to match lensless so that
+    loss and metrics are computed at the same resolution.
+
+    Pipeline: lensless (fixed 380×507) → pad to FFT size → ADMM → crop back
+    → compare with lensed resized to lensless size.
     """
     result_batch = {}
 
-    # Maximum spatial size to prevent OOM on large lensed images.
-    # DigiCam lensed images vary from ~190px to ~500px; cap at 270px.
+    # Maximum spatial size to prevent OOM on GPU.
+    # DigiCam lensless is fixed at 380×507; cap at 270px to fit T4 VRAM.
     MAX_SIZE = 270
 
-    # Determine target size: prefer lensed (ground truth) size if available,
-    # otherwise fall back to lensless size.
-    if "lensed" in dataset_items[0]:
-        target_h, target_w = dataset_items[0]["lensed"].shape[1:]
-    else:
-        target_h, target_w = dataset_items[0]["lensless"].shape[1:]
+    # Target size is always driven by lensless (the model input), not lensed.
+    # This is correct because the forward model operates on lensless resolution.
+    target_h, target_w = dataset_items[0]["lensless"].shape[1:]
 
     # Cap to MAX_SIZE while preserving aspect ratio
     if target_h > MAX_SIZE or target_w > MAX_SIZE:
