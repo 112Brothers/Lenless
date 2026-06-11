@@ -11,6 +11,10 @@ class Trainer(BaseTrainer):
         """
         Run batch through the model, compute metrics, compute loss,
         and do training step (during training stage).
+
+        Note: lr_scheduler.step() is NOT called here — it is called
+        once per epoch in _train_epoch() to match CosineAnnealingLR
+        which expects T_max in epochs, not steps.
         """
         batch = self.move_batch_to_device(batch)
         batch = self.transform_batch(batch)
@@ -31,8 +35,7 @@ class Trainer(BaseTrainer):
             batch["loss"].backward()
             self._clip_grad_norm()
             self.optimizer.step()
-            if self.lr_scheduler is not None:
-                self.lr_scheduler.step()
+            # lr_scheduler.step() moved to _train_epoch (per-epoch, not per-batch)
 
         # Update metrics for each loss
         for loss_name in self.config.writer.loss_names:
@@ -41,6 +44,21 @@ class Trainer(BaseTrainer):
         for met in metric_funcs:
             metrics.update(met.name, met(**batch))
         return batch
+
+    def _train_epoch(self, epoch):
+        """Override to call lr_scheduler.step() once per epoch."""
+        logs = super()._train_epoch(epoch)
+        # Step LR scheduler once per epoch (CosineAnnealingLR with T_max=n_epochs)
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
+            if hasattr(self, 'writer'):
+                try:
+                    self.writer.add_scalar(
+                        "learning_rate_epoch", self.lr_scheduler.get_last_lr()[0]
+                    )
+                except Exception:
+                    pass
+        return logs
 
     def _log_batch(self, batch_idx, batch, mode="train"):
         """
