@@ -10,6 +10,7 @@ defaults:
 optimizer:
   _target_: torch.optim.Adam
   lr: 1.0e-4
+  weight_decay: 1.0e-5
 
 lr_scheduler:
   _target_: torch.optim.lr_scheduler.CosineAnnealingLR
