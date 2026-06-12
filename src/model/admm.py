@@ -1,11 +1,21 @@
 """
-Standard ADMM for lensless image reconstruction with TV regularization.
-Fixed hyperparameters (not learnable).
+Standard ADMM (fixed hyperparameters) for lensless reconstruction.
 
 Reference: "Learned reconstructions for practical mask-based lensless imaging"
-           https://arxiv.org/abs/1908.11502
+           Monakhova et al., Opt. Express 2019. https://arxiv.org/abs/1908.11502
 
-Task spec hyperparameters: mu = 1e-4, tau = 2e-4.
+ADMM solves: min_x 0.5*||C*H*x - y||^2 + tau*TV(x)  s.t. x >= 0
+via 3-variable splitting:
+  v = C*H*x  (data fidelity, crop operator C)
+  u = D*x    (TV, finite differences D)
+  w = x      (non-negativity)
+
+x-update denominator: mu1*|H|^2 + mu2*(|Dx|^2 + |Dy|^2) + mu3
+u-update: soft_threshold(D*x + alpha2/mu2, tau/mu2)
+v-update: (mu1*C*H*x + Cty + alpha1) / (mu1 + 1)
+w-update: max(x + alpha3/mu3, 0)
+
+Hyperparameters per task spec: mu1=mu2=mu3=1e-4, tau=2e-4.
 TV regularizer: anisotropic (separate x/y soft-thresholding).
 Finite differences: circular (roll-based).
 Working space: padded ~2H x 2W FFT-friendly space.
@@ -28,22 +38,19 @@ from src.model.fft_utils import (
 
 class ADMM(nn.Module):
     """
-    Standard ADMM for lensless image reconstruction with TV regularization.
-    Fixed hyperparameters (not learnable).
+    Standard ADMM with fixed hyperparameters for lensless reconstruction.
 
-    ADMM solves: min_x 0.5*||Hx - y||^2 + tau*TV(x)
-    via variable splitting with z = Dx, u = dual variable.
-
-    x-update: (H^T H + mu*(Dx^T Dx + Dy^T Dy)) x = H^T y + mu*D^T(z - u)
-    z-update: z = soft_threshold(Dx + u, tau/mu)
-    u-update: u = u + Dx - z
+    3-variable splitting ADMM:
+      v = C*H*x  (data fidelity with crop C)
+      u = D*x    (TV regularization)
+      w = x      (non-negativity constraint)
     """
 
     def __init__(self, n_iter=100, mu=1e-4, tau=2e-4):
         super().__init__()
         self.n_iter = n_iter
-        self.mu = mu
-        self.tau = tau
+        self.mu = mu    # penalty for all three constraints (mu1=mu2=mu3=mu)
+        self.tau = tau  # TV soft-threshold parameter
 
     def forward(self, lensless, mask, **batch):
         """
@@ -55,6 +62,8 @@ class ADMM(nn.Module):
         """
         B, C, H, W = lensless.shape
         device = lensless.device
+        mu1 = mu2 = mu3 = self.mu
+        tau = self.tau
 
         # Compute padded FFT shape (~2H x 2W, FFT-friendly)
         fft_shape = compute_fft_shape(H, W)
@@ -73,53 +82,60 @@ class ADMM(nn.Module):
         dx_abs_sq = torch.abs(dx_otf) ** 2
         dy_abs_sq = torch.abs(dy_otf) ** 2
 
-        # Precompute denominator for x-update (fixed mu)
-        # denom = |H|^2 + mu * (|Dx|^2 + |Dy|^2)
-        denom = otf_abs_sq + self.mu * (dx_abs_sq + dy_abs_sq) + 1e-8
-
-        # Precompute H^T y in frequency domain
+        # Precompute C^T y (zero-pad measurement to fft_shape)
         y_padded = pad_to_fft(lensless, fft_shape)
-        Y = torch.fft.rfft2(y_padded)
-        ATy = otf_conj * Y                          # (B, C, fft_H, fft_W//2+1)
+
+        # Precompute x-update denominator (constant across iterations)
+        denom = mu1 * otf_abs_sq + mu2 * (dx_abs_sq + dy_abs_sq) + mu3 + 1e-8
 
         # Initialize ADMM variables (all zeros in padded space)
-        zx = torch.zeros(B, C, fft_shape[0], fft_shape[1], device=device)
-        zy = torch.zeros_like(zx)
-        ux = torch.zeros_like(zx)
-        uy = torch.zeros_like(zx)
-
-        # Soft-threshold value: tau/mu (standard ADMM proximal derivation)
-        threshold = self.tau / self.mu
+        x = torch.zeros(B, C, fft_shape[0], fft_shape[1], device=device)
+        v = torch.zeros_like(x)
+        ux_var = torch.zeros_like(x)
+        uy_var = torch.zeros_like(x)
+        w = torch.zeros_like(x)
+        alpha1 = torch.zeros_like(x)
+        alpha2x = torch.zeros_like(x)
+        alpha2y = torch.zeros_like(x)
+        alpha3 = torch.zeros_like(x)
 
         for _ in range(self.n_iter):
             # x-update: solve in frequency domain
-            # (H^T H + mu*(Dx^T Dx + Dy^T Dy)) X = H^T y + mu * D^T(z - u)
-            rhs_spatial = finite_diff_adjoint(zx - ux, zy - uy)
-            RHS = ATy + self.mu * torch.fft.rfft2(rhs_spatial)
-            X = RHS / denom
+            rhs_tv = finite_diff_adjoint(ux_var - alpha2x / mu2, uy_var - alpha2y / mu2)
+            rhs_spatial = (
+                mu1 * torch.fft.irfft2(otf_conj * torch.fft.rfft2(v - alpha1 / mu1), s=fft_shape)
+                + mu2 * rhs_tv
+                + mu3 * (w - alpha3 / mu3)
+            )
+            X = torch.fft.rfft2(rhs_spatial) / denom
             x = torch.fft.irfft2(X, s=fft_shape)
 
-            # Compute finite differences of x
+            # v-update: data fidelity
+            Hx_padded = torch.fft.irfft2(otf * torch.fft.rfft2(x), s=fft_shape)
+            v = (mu1 * Hx_padded + y_padded + alpha1) / (mu1 + 1.0)
+
+            # u-update: anisotropic TV proximal step
             dx, dy = finite_diff(x)
+            ux_var = soft_threshold(dx + alpha2x / mu2, tau / mu2)
+            uy_var = soft_threshold(dy + alpha2y / mu2, tau / mu2)
 
-            # z-update: anisotropic TV proximal step
-            # prox_{(tau/mu)*||.||_1}(v) = soft_threshold(v, tau/mu)
-            zx = soft_threshold(dx + ux, threshold)
-            zy = soft_threshold(dy + uy, threshold)
+            # w-update: non-negativity projection
+            w = torch.clamp(x + alpha3 / mu3, min=0.0)
 
-            # u-update (scaled dual variable)
-            ux = ux + dx - zx
-            uy = uy + dy - zy
+            # Dual updates
+            alpha1 = alpha1 + mu1 * (Hx_padded - v)
+            alpha2x = alpha2x + mu2 * (dx - ux_var)
+            alpha2y = alpha2y + mu2 * (dy - uy_var)
+            alpha3 = alpha3 + mu3 * (x - w)
 
         # Crop back to original image size
         reconstruction = crop_from_fft(x, (H, W))
 
         # Normalize per sample: clamp negatives then divide by max.
-        # This matches the Le-ADMM paper's normalize_image() function.
         reconstruction = torch.clamp(reconstruction, min=0.0)
-        recon_flat = reconstruction.flatten(1)                          # (B, C*H*W)
-        recon_max = recon_flat.max(dim=1).values.clamp(min=1e-8)       # (B,)
-        recon_max = recon_max[:, None, None, None]                      # (B, 1, 1, 1)
+        recon_flat = reconstruction.flatten(1)
+        recon_max = recon_flat.max(dim=1).values.clamp(min=1e-8)
+        recon_max = recon_max[:, None, None, None]
         reconstruction = reconstruction / recon_max
 
         return {"reconstruction": reconstruction}

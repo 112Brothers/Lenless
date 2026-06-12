@@ -1,11 +1,25 @@
 """
 Unrolled Learned ADMM (Le-ADMM) for lensless reconstruction.
-mu and tau are learnable per iteration.
+mu1, mu2, mu3, tau are learnable per iteration.
 
 Reference: "Learned reconstructions for practical mask-based lensless imaging"
-           https://arxiv.org/abs/1908.11502
+           Monakhova et al., Opt. Express 2019. https://arxiv.org/abs/1908.11502
 
-Hyperparameters per task spec: mu_i = 1e-4, tau_i = 2e-4 (initial values).
+ADMM solves: min_x 0.5*||C*H*x - y||^2 + tau*TV(x)  s.t. x >= 0
+via 3-variable splitting:
+  v = C*H*x  (data fidelity, crop operator C)
+  u = D*x    (TV, finite differences D)
+  w = x      (non-negativity)
+
+x-update: (mu1*H^T C^T C H + mu2*D^T D + mu3*I) x = mu1*H^T C^T(v - alpha1/mu1)
+                                                     + mu2*D^T(u - alpha2/mu2)
+                                                     + mu3*(w - alpha3/mu3)
+u-update: u = soft_threshold(D*x + alpha2/mu2, tau/mu2)
+v-update: v = (C*H*x + alpha1/mu1 + Cty/mu1) / (1 + 1/mu1)  [simplified]
+w-update: w = max(x + alpha3/mu3, 0)
+dual updates: alpha_i += mu_i * (primal_residual_i)
+
+Hyperparameters per task spec: mu1=mu2=mu3=1e-4, tau=2e-4 (initial values).
 TV regularizer: anisotropic (separate x/y soft-thresholding).
 Finite differences: circular (roll-based).
 Working space: padded ~2H x 2W FFT-friendly space.
@@ -29,14 +43,14 @@ from src.model.fft_utils import (
 class LeADMM(nn.Module):
     """
     Unrolled Learned ADMM (Le-ADMM) for lensless reconstruction.
-    mu and tau are learnable per iteration (stored as log for positivity).
+    mu1, mu2, mu3, tau are learnable per iteration (stored as log for positivity).
 
-    ADMM solves: min_x 0.5*||Hx - y||^2 + tau*TV(x)
-    via variable splitting with z = Dx, u = dual variable.
+    3-variable splitting ADMM:
+      v = C*H*x  (data fidelity with crop C)
+      u = D*x    (TV regularization)
+      w = x      (non-negativity constraint)
 
-    x-update: (H^T H + mu*(Dx^T Dx + Dy^T Dy)) x = H^T y + mu*D^T(z - u)
-    z-update: z = soft_threshold(Dx + u, tau/mu)
-    u-update: u = u + Dx - z
+    x-update denominator: mu1*|H|^2 + mu2*(|Dx|^2 + |Dy|^2) + mu3
     """
 
     def __init__(self, n_iter=20, init_mu=1e-4, init_tau=2e-4):
@@ -45,7 +59,15 @@ class LeADMM(nn.Module):
 
         # Learnable parameters per iteration, stored as log for positivity.
         # Task spec: mu_i = 1e-4, tau_i = 2e-4 (initial values).
-        self.log_mu = nn.ParameterList([
+        self.log_mu1 = nn.ParameterList([
+            nn.Parameter(torch.tensor(float(init_mu)).log())
+            for _ in range(n_iter)
+        ])
+        self.log_mu2 = nn.ParameterList([
+            nn.Parameter(torch.tensor(float(init_mu)).log())
+            for _ in range(n_iter)
+        ])
+        self.log_mu3 = nn.ParameterList([
             nn.Parameter(torch.tensor(float(init_mu)).log())
             for _ in range(n_iter)
         ])
@@ -82,49 +104,78 @@ class LeADMM(nn.Module):
         dx_abs_sq = torch.abs(dx_otf) ** 2
         dy_abs_sq = torch.abs(dy_otf) ** 2
 
-        # Precompute H^T y in frequency domain
+        # Precompute H^T C^T y in frequency domain
+        # C^T y = zero-pad y to fft_shape (C is the crop operator)
         y_padded = pad_to_fft(lensless, fft_shape)
         Y = torch.fft.rfft2(y_padded)
-        ATy = otf_conj * Y                          # (B, C, fft_H, fft_W//2+1)
+        ATy = otf_conj * Y                          # H^T C^T y
 
         # Initialize ADMM variables (all zeros in padded space)
-        zx = torch.zeros(B, C, fft_shape[0], fft_shape[1], device=device)
-        zy = torch.zeros_like(zx)
-        ux = torch.zeros_like(zx)
-        uy = torch.zeros_like(zx)
+        x = torch.zeros(B, C, fft_shape[0], fft_shape[1], device=device)
+        # v: data fidelity variable (in padded space, represents C*H*x)
+        v = torch.zeros_like(x)
+        # u: TV variable (x and y finite differences)
+        ux_var = torch.zeros_like(x)
+        uy_var = torch.zeros_like(x)
+        # w: non-negativity variable
+        w = torch.zeros_like(x)
+        # Dual variables
+        alpha1 = torch.zeros_like(x)   # dual for v = C*H*x
+        alpha2x = torch.zeros_like(x)  # dual for ux = Dx*x
+        alpha2y = torch.zeros_like(x)  # dual for uy = Dy*x
+        alpha3 = torch.zeros_like(x)   # dual for w = x
 
         for i in range(self.n_iter):
-            mu = torch.exp(self.log_mu[i])
+            mu1 = torch.exp(self.log_mu1[i])
+            mu2 = torch.exp(self.log_mu2[i])
+            mu3 = torch.exp(self.log_mu3[i])
             tau = torch.exp(self.log_tau[i])
 
             # x-update: solve in frequency domain
-            # (H^T H + mu*(Dx^T Dx + Dy^T Dy)) X = H^T y + mu * D^T(z - u)
-            denom = otf_abs_sq + mu * (dx_abs_sq + dy_abs_sq) + 1e-8
-            rhs_spatial = finite_diff_adjoint(zx - ux, zy - uy)
-            RHS = ATy + mu * torch.fft.rfft2(rhs_spatial)
-            X = RHS / denom
+            # (mu1*H^T H + mu2*(Dx^T Dx + Dy^T Dy) + mu3*I) X =
+            #   mu1*H^T(v - alpha1/mu1) + mu2*D^T(u - alpha2/mu2) + mu3*(w - alpha3/mu3)
+            denom = mu1 * otf_abs_sq + mu2 * (dx_abs_sq + dy_abs_sq) + mu3 + 1e-8
+            rhs_tv = finite_diff_adjoint(ux_var - alpha2x / mu2, uy_var - alpha2y / mu2)
+            rhs_spatial = (
+                mu1 * torch.fft.irfft2(otf_conj * torch.fft.rfft2(v - alpha1 / mu1), s=fft_shape)
+                + mu2 * rhs_tv
+                + mu3 * (w - alpha3 / mu3)
+            )
+            X = torch.fft.rfft2(rhs_spatial) / denom
             x = torch.fft.irfft2(X, s=fft_shape)
 
-            # Compute finite differences of x
+            # v-update: v = (C*H*x + y/mu1 + alpha1/mu1) / (1/mu1 + 1)
+            # Simplified: v = (mu1 * C*H*x + Cty + alpha1) / (mu1 + 1)
+            # C*H*x in padded space = ifft(H * fft(x))
+            Hx_padded = torch.fft.irfft2(otf * torch.fft.rfft2(x), s=fft_shape)
+            v = (mu1 * Hx_padded + y_padded + alpha1) / (mu1 + 1.0)
+
+            # u-update: anisotropic TV proximal step
             dx, dy = finite_diff(x)
+            ux_var = soft_threshold(dx + alpha2x / mu2, tau / mu2)
+            uy_var = soft_threshold(dy + alpha2y / mu2, tau / mu2)
 
-            # z-update: anisotropic TV proximal step
-            # prox_{(tau/mu)*||.||_1}(v) = soft_threshold(v, tau/mu)
-            zx = soft_threshold(dx + ux, tau / mu)
-            zy = soft_threshold(dy + uy, tau / mu)
+            # w-update: non-negativity projection
+            w = torch.clamp(x + alpha3 / mu3, min=0.0)
 
-            # u-update (scaled dual variable)
-            ux = ux + dx - zx
-            uy = uy + dy - zy
+            # Dual updates
+            alpha1 = alpha1 + mu1 * (Hx_padded - v)
+            alpha2x = alpha2x + mu2 * (dx - ux_var)
+            alpha2y = alpha2y + mu2 * (dy - uy_var)
+            alpha3 = alpha3 + mu3 * (x - w)
 
         # Extra x-update after the loop so that log_tau[-1] receives gradient.
-        # (log_tau[-1] only affects z[-1], which feeds into the final u-update,
-        #  which feeds into this extra x-update.)
-        mu_last = torch.exp(self.log_mu[-1])
-        denom_last = otf_abs_sq + mu_last * (dx_abs_sq + dy_abs_sq) + 1e-8
-        rhs_spatial = finite_diff_adjoint(zx - ux, zy - uy)
-        RHS = ATy + mu_last * torch.fft.rfft2(rhs_spatial)
-        X = RHS / denom_last
+        mu1_last = torch.exp(self.log_mu1[-1])
+        mu2_last = torch.exp(self.log_mu2[-1])
+        mu3_last = torch.exp(self.log_mu3[-1])
+        denom_last = mu1_last * otf_abs_sq + mu2_last * (dx_abs_sq + dy_abs_sq) + mu3_last + 1e-8
+        rhs_tv = finite_diff_adjoint(ux_var - alpha2x / mu2_last, uy_var - alpha2y / mu2_last)
+        rhs_spatial = (
+            mu1_last * torch.fft.irfft2(otf_conj * torch.fft.rfft2(v - alpha1 / mu1_last), s=fft_shape)
+            + mu2_last * rhs_tv
+            + mu3_last * (w - alpha3 / mu3_last)
+        )
+        X = torch.fft.rfft2(rhs_spatial) / denom_last
         x = torch.fft.irfft2(X, s=fft_shape)
 
         # Crop back to original image size
