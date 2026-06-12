@@ -18,7 +18,7 @@ lr_scheduler:
 
 loss_function:
   _target_: src.loss.ReconstructionLoss
-  lpips_weight: 0.01
+  lpips_weight: 0.1
 
 trainer:
   log_step: 50

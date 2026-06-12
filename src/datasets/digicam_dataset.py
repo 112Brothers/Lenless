@@ -54,10 +54,8 @@ class DigiCamDataset(Dataset):
         from huggingface_hub import hf_hub_download
 
         masks = {}
-        # Find unique mask labels in dataset
-        unique_labels = set()
-        for i in range(len(self.hf_dataset)):
-            unique_labels.add(self.hf_dataset[i]["mask_label"])
+        # Use the HF dataset column directly — O(1) vs O(N) item iteration
+        unique_labels = set(self.hf_dataset["mask_label"])
 
         logger.info(f"Loading {len(unique_labels)} PSF masks from HuggingFace...")
         for label in sorted(unique_labels):
