@@ -46,7 +46,9 @@ def collate_fn(dataset_items: list[dict]):
         lensless_list.append(img)
     result_batch["lensless"] = torch.stack(lensless_list)
 
-    # Resize all masks to target size
+    # Resize all masks to target size and renormalize so sum=1 is preserved.
+    # The PSF mask is normalized to sum=1 in the dataset, but bilinear resize
+    # changes the sum. Renormalize after resize to keep the forward model correct.
     mask_list = []
     for item in dataset_items:
         mask = item["mask"]
@@ -54,6 +56,9 @@ def collate_fn(dataset_items: list[dict]):
             mask = F.interpolate(
                 mask.unsqueeze(0).unsqueeze(0), size=(target_h, target_w), mode="bilinear", align_corners=False
             ).squeeze(0).squeeze(0)
+            # Renormalize so PSF still sums to 1 after resize
+            mask_sum = mask.sum().clamp(min=1e-8)
+            mask = mask / mask_sum
         mask_list.append(mask)
     result_batch["mask"] = torch.stack(mask_list)
 

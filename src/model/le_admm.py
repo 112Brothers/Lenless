@@ -164,15 +164,25 @@ class LeADMM(nn.Module):
             alpha2y = alpha2y + mu2 * (dy - uy_var)
             alpha3 = alpha3 + mu3 * (x - w)
 
-        # Extra x-update after the loop so that log_tau[-1] receives gradient.
+        # Extra u-update + x-update after the loop so that log_tau[-1] receives gradient.
+        # tau only appears in the u-update (soft_threshold), so we must redo it here
+        # with tau_last to create a gradient path through log_tau[-1].
         mu1_last = torch.exp(self.log_mu1[-1])
         mu2_last = torch.exp(self.log_mu2[-1])
         mu3_last = torch.exp(self.log_mu3[-1])
+        tau_last = torch.exp(self.log_tau[-1])
+
+        # Redo u-update with tau_last → log_tau[-1] gets gradient
+        dx_last, dy_last = finite_diff(x)
+        ux_last = soft_threshold(dx_last + alpha2x / mu2_last, tau_last / mu2_last)
+        uy_last = soft_threshold(dy_last + alpha2y / mu2_last, tau_last / mu2_last)
+
+        # x-update using the fresh u variables (which depend on tau_last)
         denom_last = mu1_last * otf_abs_sq + mu2_last * (dx_abs_sq + dy_abs_sq) + mu3_last + 1e-8
-        rhs_tv = finite_diff_adjoint(ux_var - alpha2x / mu2_last, uy_var - alpha2y / mu2_last)
+        rhs_tv_last = finite_diff_adjoint(ux_last - alpha2x / mu2_last, uy_last - alpha2y / mu2_last)
         rhs_spatial = (
             mu1_last * torch.fft.irfft2(otf_conj * torch.fft.rfft2(v - alpha1 / mu1_last), s=fft_shape)
-            + mu2_last * rhs_tv
+            + mu2_last * rhs_tv_last
             + mu3_last * (w - alpha3 / mu3_last)
         )
         X = torch.fft.rfft2(rhs_spatial) / denom_last
