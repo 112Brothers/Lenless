@@ -51,6 +51,7 @@ class ADMM(nn.Module):
         self.n_iter = n_iter
         self.mu = mu    # penalty for all three constraints (mu1=mu2=mu3=mu)
         self.tau = tau  # TV soft-threshold parameter
+        self.psf_scale = 5.0  # fixed scale matching empirical findings
 
     def forward(self, lensless, mask, **batch):
         """
@@ -72,8 +73,12 @@ class ADMM(nn.Module):
         if mask.ndim == 3:
             mask = mask.unsqueeze(1)
 
+        # Renormalize PSF and apply scale factor
+        psf_p = mask / (mask.sum(dim=(-2, -1), keepdim=True) + 1e-12)
+        psf_p = psf_p * self.psf_scale
+
         # Compute OTF and its conjugate/magnitude-squared
-        otf = psf_to_otf(mask, fft_shape)          # (B, 1, fft_H, fft_W//2+1)
+        otf = psf_to_otf(psf_p, fft_shape)         # (B, 1, fft_H, fft_W//2+1)
         otf_conj = torch.conj(otf)
         otf_abs_sq = torch.abs(otf) ** 2            # |H|^2
 
@@ -115,9 +120,12 @@ class ADMM(nn.Module):
             v = (mu1 * Hx_padded + y_padded + alpha1) / (mu1 + 1.0)
 
             # u-update: anisotropic TV proximal step
+            # Use tau directly as threshold (matching original Le-ADMM reference code),
+            # NOT tau/mu2. With tau=2e-4 and [0,1] images, tau/mu2=2.0 would zero out
+            # all finite differences (max ~1.0), completely disabling TV regularization.
             dx, dy = finite_diff(x)
-            ux_var = soft_threshold(dx + alpha2x / mu2, tau / mu2)
-            uy_var = soft_threshold(dy + alpha2y / mu2, tau / mu2)
+            ux_var = soft_threshold(dx + alpha2x / mu2, tau)
+            uy_var = soft_threshold(dy + alpha2y / mu2, tau)
 
             # w-update: non-negativity projection
             w = torch.clamp(x + alpha3 / mu3, min=0.0)

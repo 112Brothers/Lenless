@@ -4,8 +4,13 @@ Modular Le-ADMM with optional DRUNet pre/post-processors.
 Architecture (from Bezzam et al., arXiv 2502.01102):
     y → [Pre-processor (DRUNet)] → y' → [Le-ADMM-5] → x̂ → [Post-processor (DRUNet)] → x_final
 
-Pre-processor: DRUNet with no output activation (can output any range)
-Post-processor: DRUNet with sigmoid to clamp output to [0, 1]
+Pre-processor: residual DRUNet — y' = lensless + pre(lensless)
+  At init (tail=0), y' = lensless (identity). Learns to refine the measurement.
+
+Post-processor: residual DRUNet — x_final = clamp(admm_out + post(admm_out), 0, 1)
+  At init (tail=0), x_final = admm_out (identity). Learns to refine the reconstruction.
+  Using clamp instead of sigmoid avoids the 'gray image' local minimum where
+  sigmoid(0) = 0.5 everywhere at initialization.
 
 For ~8M total parameters (matching paper's Pre4+LeADMM5+Post4):
     channels=(32, 64, 116, 128), n_res_blocks=3 → ~3.92M per processor
@@ -24,6 +29,9 @@ class ModularLeADMM(nn.Module):
 
     Architecture:
         y → [Pre-processor] → y' → [Le-ADMM-5] → x̂ → [Post-processor] → x_final
+
+    Both processors use residual connections and zero-initialized tails so the
+    model starts as identity (passes measurement/reconstruction unchanged).
     """
 
     def __init__(
@@ -50,7 +58,8 @@ class ModularLeADMM(nn.Module):
         self.use_pre = use_pre
         self.use_post = use_post
 
-        # Pre-processor: DRUNet, no output activation (can output any range)
+        # Pre-processor: DRUNet with zero-initialized tail for residual learning.
+        # At init: pre(lensless) ≈ 0, so y' = lensless + 0 = lensless (identity).
         if use_pre:
             self.pre_processor = DRUNet(
                 in_channels=3,
@@ -58,13 +67,17 @@ class ModularLeADMM(nn.Module):
                 channels=drunet_channels,
                 n_res_blocks=drunet_n_res_blocks,
             )
+            # Zero-init tail so pre-processor starts as identity (residual learning)
+            nn.init.zeros_(self.pre_processor.tail.weight)
+            nn.init.zeros_(self.pre_processor.tail.bias)
         else:
-            self.pre_processor = nn.Identity()
+            self.pre_processor = None
 
         # Le-ADMM core
         self.le_admm = LeADMM(n_iter=n_iter, init_mu=init_mu, init_tau=init_tau)
 
-        # Post-processor: DRUNet with sigmoid to clamp output to [0, 1]
+        # Post-processor: DRUNet with zero-initialized tail for residual learning.
+        # At init: post(admm_out) ≈ 0, so x_final = clamp(admm_out + 0, 0, 1) = admm_out.
         if use_post:
             self.post_processor = DRUNet(
                 in_channels=3,
@@ -72,10 +85,11 @@ class ModularLeADMM(nn.Module):
                 channels=drunet_channels,
                 n_res_blocks=drunet_n_res_blocks,
             )
+            # Zero-init tail so post-processor starts as identity (residual learning)
+            nn.init.zeros_(self.post_processor.tail.weight)
+            nn.init.zeros_(self.post_processor.tail.bias)
         else:
-            self.post_processor = nn.Identity()
-
-        self.use_sigmoid_post = use_post  # apply sigmoid only when post-processor is DRUNet
+            self.post_processor = None
 
     def forward(self, lensless, mask, **batch):
         """
@@ -85,18 +99,24 @@ class ModularLeADMM(nn.Module):
         Returns:
             dict with "reconstruction": (B, C, H, W)
         """
-        # Pre-process the measurement
-        y = self.pre_processor(lensless)
+        # Pre-process: residual refinement of the measurement.
+        # y' = lensless + pre(lensless). At init, pre ≈ 0 so y' = lensless.
+        if self.use_pre:
+            y = lensless + self.pre_processor(lensless)
+        else:
+            y = lensless
 
-        # Run Le-ADMM
+        # Run Le-ADMM on the (possibly refined) measurement
         admm_out = self.le_admm(y, mask)["reconstruction"]
 
-        # Post-process the reconstruction
-        reconstruction = self.post_processor(admm_out)
-
-        # Apply sigmoid to clamp to [0, 1] when post-processor is used
-        if self.use_sigmoid_post:
-            reconstruction = torch.sigmoid(reconstruction)
+        # Post-process: residual refinement of the reconstruction.
+        # x_final = clamp(admm_out + post(admm_out), 0, 1).
+        # At init, post ≈ 0 so x_final = admm_out (already in [0,1]).
+        # clamp avoids the 'gray image' local minimum of sigmoid(0)=0.5.
+        if self.use_post:
+            reconstruction = torch.clamp(admm_out + self.post_processor(admm_out), 0.0, 1.0)
+        else:
+            reconstruction = admm_out
 
         return {"reconstruction": reconstruction}
 

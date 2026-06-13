@@ -14,7 +14,11 @@ via 3-variable splitting:
 x-update: (mu1*H^T C^T C H + mu2*D^T D + mu3*I) x = mu1*H^T C^T(v - alpha1/mu1)
                                                      + mu2*D^T(u - alpha2/mu2)
                                                      + mu3*(w - alpha3/mu3)
-u-update: u = soft_threshold(D*x + alpha2/mu2, tau/mu2)
+u-update: u = soft_threshold(D*x + alpha2/mu2, tau)
+  NOTE: tau is used directly as the threshold (matching the original Le-ADMM
+  reference implementation), NOT tau/mu2. This keeps tau in the same scale as
+  the finite differences of a [0,1] image (max ~1.0), so tau=2e-4 gives a
+  meaningful TV threshold and log_tau receives non-zero gradients.
 v-update: v = (C*H*x + alpha1/mu1 + Cty/mu1) / (1 + 1/mu1)  [simplified]
 w-update: w = max(x + alpha3/mu3, 0)
 dual updates: alpha_i += mu_i * (primal_residual_i)
@@ -76,6 +80,11 @@ class LeADMM(nn.Module):
             for _ in range(n_iter)
         ])
 
+        # Learnable PSF scale: psf = psf / sum * psf_scale
+        # Initialized to 5.0 based on empirical findings — PSF normalized to
+        # sum=1 is too weak; scaling by ~5 gives better ADMM convergence.
+        self.psf_scale = nn.Parameter(torch.tensor(5.0))
+
     def forward(self, lensless, mask, **batch):
         """
         Args:
@@ -94,8 +103,13 @@ class LeADMM(nn.Module):
         if mask.ndim == 3:
             mask = mask.unsqueeze(1)
 
+        # Renormalize PSF and apply learnable scale factor.
+        # psf_scale is initialized to 1.0 (no change at init).
+        psf_p = mask / (mask.sum(dim=(-2, -1), keepdim=True) + 1e-12)
+        psf_p = psf_p * self.psf_scale
+
         # Compute OTF and its conjugate/magnitude-squared
-        otf = psf_to_otf(mask, fft_shape)          # (B, 1, fft_H, fft_W//2+1)
+        otf = psf_to_otf(psf_p, fft_shape)         # (B, 1, fft_H, fft_W//2+1)
         otf_conj = torch.conj(otf)
         otf_abs_sq = torch.abs(otf) ** 2            # |H|^2
 
@@ -151,9 +165,12 @@ class LeADMM(nn.Module):
             v = (mu1 * Hx_padded + y_padded + alpha1) / (mu1 + 1.0)
 
             # u-update: anisotropic TV proximal step
+            # Use tau directly as threshold (matching original Le-ADMM reference code),
+            # NOT tau/mu2. With tau=2e-4 and [0,1] images, tau/mu2=2.0 would zero out
+            # all finite differences (max ~1.0), killing TV and log_tau gradients.
             dx, dy = finite_diff(x)
-            ux_var = soft_threshold(dx + alpha2x / mu2, tau / mu2)
-            uy_var = soft_threshold(dy + alpha2y / mu2, tau / mu2)
+            ux_var = soft_threshold(dx + alpha2x / mu2, tau)
+            uy_var = soft_threshold(dy + alpha2y / mu2, tau)
 
             # w-update: non-negativity projection
             w = torch.clamp(x + alpha3 / mu3, min=0.0)
@@ -174,8 +191,8 @@ class LeADMM(nn.Module):
 
         # Redo u-update with tau_last → log_tau[-1] gets gradient
         dx_last, dy_last = finite_diff(x)
-        ux_last = soft_threshold(dx_last + alpha2x / mu2_last, tau_last / mu2_last)
-        uy_last = soft_threshold(dy_last + alpha2y / mu2_last, tau_last / mu2_last)
+        ux_last = soft_threshold(dx_last + alpha2x / mu2_last, tau_last)
+        uy_last = soft_threshold(dy_last + alpha2y / mu2_last, tau_last)
 
         # x-update using the fresh u variables (which depend on tau_last)
         denom_last = mu1_last * otf_abs_sq + mu2_last * (dx_abs_sq + dy_abs_sq) + mu3_last + 1e-8
