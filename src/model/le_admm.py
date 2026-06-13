@@ -208,13 +208,10 @@ class LeADMM(nn.Module):
         # Crop back to original image size
         reconstruction = crop_from_fft(x, (H, W))
 
-        # Normalize per sample: clamp negatives then divide by max.
-        # This matches the Le-ADMM paper's normalize_image() function.
-        reconstruction = torch.clamp(reconstruction, min=0.0)
-        recon_flat = reconstruction.flatten(1)                          # (B, C*H*W)
-        recon_max = recon_flat.max(dim=1).values.clamp(min=1e-8)       # (B,)
-        recon_max = recon_max[:, None, None, None]                      # (B, 1, 1, 1)
-        reconstruction = reconstruction / recon_max
+        # No normalization — pass raw ADMM output to post-processor.
+        # The post-processor (residual DRUNet + clamp) handles the final range.
+        # Max-normalization hurts residual post-processing and is not needed
+        # when a learned post-processor follows.
 
         return {"reconstruction": reconstruction}
 
