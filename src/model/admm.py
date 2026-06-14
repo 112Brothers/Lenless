@@ -109,7 +109,19 @@ class ADMM(nn.Module):
         alpha3 = torch.zeros_like(x)
 
         for _ in range(self.n_iter):
-            # x-update: solve in frequency domain
+            # u-update first (uses current x)
+            dx, dy = finite_diff(x)
+            ux_var = soft_threshold(dx + alpha2x / mu2, tau)
+            uy_var = soft_threshold(dy + alpha2y / mu2, tau)
+
+            # v-update: v = (alpha1 + mu1*Hx + C^T y) / (CTC + mu1)
+            Hx_padded = torch.fft.irfft2(otf * torch.fft.rfft2(x), s=fft_shape)
+            v = (alpha1 + mu1 * Hx_padded + y_padded) / (ctc + mu1)
+
+            # w-update (uses current x)
+            w = torch.clamp(x + alpha3 / mu3, min=0.0)
+
+            # x-update using updated u, v, w
             rhs_tv = finite_diff_adjoint(ux_var - alpha2x / mu2, uy_var - alpha2y / mu2)
             rhs_spatial = (
                 mu1 * torch.fft.irfft2(otf_conj * torch.fft.rfft2(v - alpha1 / mu1), s=fft_shape)
@@ -117,28 +129,17 @@ class ADMM(nn.Module):
                 + mu3 * (w - alpha3 / mu3)
             )
             X = torch.fft.rfft2(rhs_spatial) / denom
-            x = torch.fft.irfft2(X, s=fft_shape)
+            x_new = torch.fft.irfft2(X, s=fft_shape)
 
-            # v-update: v = (alpha1 + mu1*Hx + C^T y) / (CTC + mu1)
-            Hx_padded = torch.fft.irfft2(otf * torch.fft.rfft2(x), s=fft_shape)
-            v = (alpha1 + mu1 * Hx_padded + y_padded) / (ctc + mu1)
+            # Dual updates use x_new
+            Hx_new = torch.fft.irfft2(otf * torch.fft.rfft2(x_new), s=fft_shape)
+            dx_new, dy_new = finite_diff(x_new)
+            alpha1 = alpha1 + mu1 * (Hx_new - v)
+            alpha2x = alpha2x + mu2 * (dx_new - ux_var)
+            alpha2y = alpha2y + mu2 * (dy_new - uy_var)
+            alpha3 = alpha3 + mu3 * (x_new - w)
 
-            # u-update: anisotropic TV proximal step
-            # Use tau directly as threshold (matching original Le-ADMM reference code),
-            # NOT tau/mu2. With tau=2e-4 and [0,1] images, tau/mu2=2.0 would zero out
-            # all finite differences (max ~1.0), completely disabling TV regularization.
-            dx, dy = finite_diff(x)
-            ux_var = soft_threshold(dx + alpha2x / mu2, tau)
-            uy_var = soft_threshold(dy + alpha2y / mu2, tau)
-
-            # w-update: non-negativity projection
-            w = torch.clamp(x + alpha3 / mu3, min=0.0)
-
-            # Dual updates
-            alpha1 = alpha1 + mu1 * (Hx_padded - v)
-            alpha2x = alpha2x + mu2 * (dx - ux_var)
-            alpha2y = alpha2y + mu2 * (dy - uy_var)
-            alpha3 = alpha3 + mu3 * (x - w)
+            x = x_new
 
         # Crop back to original image size
         reconstruction = crop_from_fft(x, (H, W))

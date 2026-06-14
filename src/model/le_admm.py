@@ -150,9 +150,20 @@ class LeADMM(nn.Module):
             mu3 = torch.exp(self.log_mu3[i])
             tau = torch.exp(self.log_tau[i])
 
-            # x-update: solve in frequency domain
-            # (mu1*H^T H + mu2*(Dx^T Dx + Dy^T Dy) + mu3*I) X =
-            #   mu1*H^T(v - alpha1/mu1) + mu2*D^T(u - alpha2/mu2) + mu3*(w - alpha3/mu3)
+            # u-update: anisotropic TV proximal step (uses current x)
+            dx, dy = finite_diff(x)
+            ux_var = soft_threshold(dx + alpha2x / mu2, tau)
+            uy_var = soft_threshold(dy + alpha2y / mu2, tau)
+
+            # v-update: v = (alpha1 + mu1*Hx + C^T y) / (CTC + mu1)
+            # CTC=1 inside crop, 0 outside.
+            Hx_padded = torch.fft.irfft2(otf * torch.fft.rfft2(x), s=fft_shape)
+            v = (alpha1 + mu1 * Hx_padded + y_padded) / (ctc + mu1)
+
+            # w-update: non-negativity projection (uses current x)
+            w = torch.clamp(x + alpha3 / mu3, min=0.0)
+
+            # x-update: solve in frequency domain using updated u, v, w
             denom = mu1 * otf_abs_sq + mu2 * (dx_abs_sq + dy_abs_sq) + mu3 + 1e-8
             rhs_tv = finite_diff_adjoint(ux_var - alpha2x / mu2, uy_var - alpha2y / mu2)
             rhs_spatial = (
@@ -161,56 +172,17 @@ class LeADMM(nn.Module):
                 + mu3 * (w - alpha3 / mu3)
             )
             X = torch.fft.rfft2(rhs_spatial) / denom
-            x = torch.fft.irfft2(X, s=fft_shape)
+            x_new = torch.fft.irfft2(X, s=fft_shape)
 
-            # v-update: minimize 0.5*||C*(Hx-v)||^2 + (mu1/2)*||Hx-v+alpha1/mu1||^2
-            # Solution: v = (alpha1 + mu1*Hx + C^T y) / (CTC + mu1)
-            # where CTC=1 inside crop, 0 outside.
-            # Inside crop:  v = (alpha1 + mu1*Hx + y) / (1 + mu1)
-            # Outside crop: v = (alpha1 + mu1*Hx)     / mu1
-            Hx_padded = torch.fft.irfft2(otf * torch.fft.rfft2(x), s=fft_shape)
-            v = (alpha1 + mu1 * Hx_padded + y_padded) / (ctc + mu1)
+            # Dual updates use x_new (matching reference implementation)
+            Hx_new = torch.fft.irfft2(otf * torch.fft.rfft2(x_new), s=fft_shape)
+            dx_new, dy_new = finite_diff(x_new)
+            alpha1 = alpha1 + mu1 * (Hx_new - v)
+            alpha2x = alpha2x + mu2 * (dx_new - ux_var)
+            alpha2y = alpha2y + mu2 * (dy_new - uy_var)
+            alpha3 = alpha3 + mu3 * (x_new - w)
 
-            # u-update: anisotropic TV proximal step
-            # Use tau directly as threshold (matching original Le-ADMM reference code),
-            # NOT tau/mu2. With tau=2e-4 and [0,1] images, tau/mu2=2.0 would zero out
-            # all finite differences (max ~1.0), killing TV and log_tau gradients.
-            dx, dy = finite_diff(x)
-            ux_var = soft_threshold(dx + alpha2x / mu2, tau)
-            uy_var = soft_threshold(dy + alpha2y / mu2, tau)
-
-            # w-update: non-negativity projection
-            w = torch.clamp(x + alpha3 / mu3, min=0.0)
-
-            # Dual updates
-            alpha1 = alpha1 + mu1 * (Hx_padded - v)
-            alpha2x = alpha2x + mu2 * (dx - ux_var)
-            alpha2y = alpha2y + mu2 * (dy - uy_var)
-            alpha3 = alpha3 + mu3 * (x - w)
-
-        # Extra u-update + x-update after the loop so that log_tau[-1] receives gradient.
-        # tau only appears in the u-update (soft_threshold), so we must redo it here
-        # with tau_last to create a gradient path through log_tau[-1].
-        mu1_last = torch.exp(self.log_mu1[-1])
-        mu2_last = torch.exp(self.log_mu2[-1])
-        mu3_last = torch.exp(self.log_mu3[-1])
-        tau_last = torch.exp(self.log_tau[-1])
-
-        # Redo u-update with tau_last → log_tau[-1] gets gradient
-        dx_last, dy_last = finite_diff(x)
-        ux_last = soft_threshold(dx_last + alpha2x / mu2_last, tau_last)
-        uy_last = soft_threshold(dy_last + alpha2y / mu2_last, tau_last)
-
-        # x-update using the fresh u variables (which depend on tau_last)
-        denom_last = mu1_last * otf_abs_sq + mu2_last * (dx_abs_sq + dy_abs_sq) + mu3_last + 1e-8
-        rhs_tv_last = finite_diff_adjoint(ux_last - alpha2x / mu2_last, uy_last - alpha2y / mu2_last)
-        rhs_spatial = (
-            mu1_last * torch.fft.irfft2(otf_conj * torch.fft.rfft2(v - alpha1 / mu1_last), s=fft_shape)
-            + mu2_last * rhs_tv_last
-            + mu3_last * (w - alpha3 / mu3_last)
-        )
-        X = torch.fft.rfft2(rhs_spatial) / denom_last
-        x = torch.fft.irfft2(X, s=fft_shape)
+            x = x_new
 
         # Crop back to original image size
         reconstruction = crop_from_fft(x, (H, W))
