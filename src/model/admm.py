@@ -90,6 +90,10 @@ class ADMM(nn.Module):
         # Precompute C^T y (zero-pad measurement to fft_shape)
         y_padded = pad_to_fft(lensless, fft_shape)
 
+        # CTC mask: 1 inside crop region, 0 outside
+        ones_y = torch.ones(B, C, H, W, device=device)
+        ctc = pad_to_fft(ones_y, fft_shape)
+
         # Precompute x-update denominator (constant across iterations)
         denom = mu1 * otf_abs_sq + mu2 * (dx_abs_sq + dy_abs_sq) + mu3 + 1e-8
 
@@ -115,9 +119,9 @@ class ADMM(nn.Module):
             X = torch.fft.rfft2(rhs_spatial) / denom
             x = torch.fft.irfft2(X, s=fft_shape)
 
-            # v-update: data fidelity
+            # v-update: v = (alpha1 + mu1*Hx + C^T y) / (CTC + mu1)
             Hx_padded = torch.fft.irfft2(otf * torch.fft.rfft2(x), s=fft_shape)
-            v = (mu1 * Hx_padded + y_padded + alpha1) / (mu1 + 1.0)
+            v = (alpha1 + mu1 * Hx_padded + y_padded) / (ctc + mu1)
 
             # u-update: anisotropic TV proximal step
             # Use tau directly as threshold (matching original Le-ADMM reference code),

@@ -118,11 +118,16 @@ class LeADMM(nn.Module):
         dx_abs_sq = torch.abs(dx_otf) ** 2
         dy_abs_sq = torch.abs(dy_otf) ** 2
 
-        # Precompute H^T C^T y in frequency domain
-        # C^T y = zero-pad y to fft_shape (C is the crop operator)
+        # Precompute C^T y (zero-pad measurement to fft_shape)
         y_padded = pad_to_fft(lensless, fft_shape)
-        Y = torch.fft.rfft2(y_padded)
-        ATy = otf_conj * Y                          # H^T C^T y
+
+        # CTC mask: 1 inside the crop region (where y is observed), 0 outside.
+        # Used in v-update denominator: (CTC + mu1) instead of (1 + mu1).
+        # This correctly handles the crop operator C:
+        #   inside crop:  v = (alpha1 + mu1*Hx + y) / (1 + mu1)
+        #   outside crop: v = (alpha1 + mu1*Hx)     / mu1  = Hx + alpha1/mu1
+        ones_y = torch.ones(B, C, H, W, device=device)
+        ctc = pad_to_fft(ones_y, fft_shape)         # (B, C, fft_H, fft_W), 1 in crop, 0 outside
 
         # Initialize ADMM variables (all zeros in padded space)
         x = torch.zeros(B, C, fft_shape[0], fft_shape[1], device=device)
@@ -158,11 +163,13 @@ class LeADMM(nn.Module):
             X = torch.fft.rfft2(rhs_spatial) / denom
             x = torch.fft.irfft2(X, s=fft_shape)
 
-            # v-update: v = (C*H*x + y/mu1 + alpha1/mu1) / (1/mu1 + 1)
-            # Simplified: v = (mu1 * C*H*x + Cty + alpha1) / (mu1 + 1)
-            # C*H*x in padded space = ifft(H * fft(x))
+            # v-update: minimize 0.5*||C*(Hx-v)||^2 + (mu1/2)*||Hx-v+alpha1/mu1||^2
+            # Solution: v = (alpha1 + mu1*Hx + C^T y) / (CTC + mu1)
+            # where CTC=1 inside crop, 0 outside.
+            # Inside crop:  v = (alpha1 + mu1*Hx + y) / (1 + mu1)
+            # Outside crop: v = (alpha1 + mu1*Hx)     / mu1
             Hx_padded = torch.fft.irfft2(otf * torch.fft.rfft2(x), s=fft_shape)
-            v = (mu1 * Hx_padded + y_padded + alpha1) / (mu1 + 1.0)
+            v = (alpha1 + mu1 * Hx_padded + y_padded) / (ctc + mu1)
 
             # u-update: anisotropic TV proximal step
             # Use tau directly as threshold (matching original Le-ADMM reference code),
